@@ -12,20 +12,30 @@
       "types": "./dist/types/index.d.ts"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json && tsc -p tsconfig.types.json",
     "dev": "tsc -p tsconfig.types.json --watch",
-    "test": "npm run build && node test_crypto.mjs",
+    "test": "npm run build && node test_crypto.mjs && node test_resume.mjs",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["vexanium", "walletconnect", "dapp", "blockchain", "wallet"],
+  "keywords": [
+    "vexanium",
+    "walletconnect",
+    "dapp",
+    "blockchain",
+    "wallet"
+  ],
   "license": "MIT",
   "dependencies": {
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.5",
-    "typescript": "^5.7.3"
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.3",
+    "ws": "^8.21.1"
   }
 }

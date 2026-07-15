@@ -1,9 +1,50 @@
-import { decryptPayload, encryptPayload, toBase64Url, type Envelope } from './crypto'
+import { decryptPayload, encryptPayload, fromBase64Url, toBase64Url, type Envelope } from './crypto.js'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Relay hosted by Pixel Genius — all sessions go through here. */
 export const VEXCONNECT_RELAY = 'wss://connect.nodespark.fun'
+
+/** How long a silent resume waits for the wallet to answer a ping before giving up. */
+const RESUME_TIMEOUT_MS = 4_000
+
+/** How often an active session pings the wallet, to catch a silently-dropped
+ * connection (idle proxies/NATs, backgrounded mobile browser, etc.) instead
+ * of finding out only when a real transaction is sent. */
+const KEEPALIVE_INTERVAL_MS = 20_000
+
+// ─── Session persistence ───────────────────────────────────────────────────────
+// Mirrors WalletConnect's pairing persistence: save the topic/key/session so a
+// page reload can resume without re-scanning a QR, as long as the wallet is
+// still around to answer the ping. One active session per browser/origin —
+// matches how a dApp typically has a single "connected wallet" at a time.
+
+const STORAGE_KEY = 'vexconnect:session'
+const hasStorage = typeof localStorage !== 'undefined'
+
+interface PersistedSession {
+  sid: string
+  symKeyB64Url: string
+  session: VexSession
+}
+
+function loadPersisted(): PersistedSession | null {
+  if (!hasStorage) return null
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? (JSON.parse(raw) as PersistedSession) : null
+  } catch {
+    return null
+  }
+}
+
+function savePersisted(p: PersistedSession) {
+  if (hasStorage) localStorage.setItem(STORAGE_KEY, JSON.stringify(p))
+}
+
+function clearPersisted() {
+  if (hasStorage) localStorage.removeItem(STORAGE_KEY)
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -59,12 +100,16 @@ export class VexConnect {
   private readonly sid: string
   private readonly symKey: Uint8Array
   private readonly opts: Required<VexConnectOptions> & { relayUrl: string }
+  /** Set only when constructed via tryResume() — the session to confirm, not yet trusted. */
+  private readonly resumeCandidate: VexSession | null
 
   private ws: WebSocket | null = null
   private session: VexSession | null = null
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null
 
   private connectResolve: ((s: VexSession) => void) | null = null
   private connectReject:  ((e: Error) => void) | null = null
+  private pongResolve: (() => void) | null = null
   private pending = new Map<string, {
     resolve: (r: TransactionResult) => void
     reject:  (e: Error) => void
@@ -73,10 +118,33 @@ export class VexConnect {
   private disconnectHandlers: Array<() => void> = []
   private errorHandlers:      Array<(e: Error) => void> = []
 
-  constructor(opts: VexConnectOptions) {
-    this.sid    = crypto.randomUUID()
-    this.symKey = crypto.getRandomValues(new Uint8Array(32))
-    this.opts   = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
+  constructor(opts: VexConnectOptions, resume?: { sid: string; symKey: Uint8Array; session: VexSession }) {
+    this.sid             = resume?.sid ?? crypto.randomUUID()
+    this.symKey          = resume?.symKey ?? crypto.getRandomValues(new Uint8Array(32))
+    this.resumeCandidate = resume?.session ?? null
+    this.opts            = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
+  }
+
+  /**
+   * Reconstructs a VexConnect from a previously-approved session saved in
+   * localStorage (mirrors WalletConnect's pairing persistence), if any.
+   * Returns null immediately if nothing's saved — no network attempt made.
+   * Call connect() on the result to confirm the wallet is still reachable;
+   * it resolves fast (a ping/pong round trip) instead of waiting for a fresh
+   * approval, or rejects if the wallet's gone, so the caller can fall back to
+   * a normal openVexConnectModal() pairing.
+   */
+  static tryResume(opts: VexConnectOptions): VexConnect | null {
+    const p = loadPersisted()
+    if (!p) return null
+    let symKey: Uint8Array
+    try {
+      symKey = fromBase64Url(p.symKeyB64Url)
+    } catch {
+      clearPersisted()
+      return null
+    }
+    return new VexConnect(opts, { sid: p.sid, symKey, session: p.session })
   }
 
   // ── URI ───────────────────────────────────────────────────────────────────
@@ -113,6 +181,10 @@ export class VexConnect {
   // ── Connection ────────────────────────────────────────────────────────────
 
   connect(): Promise<VexSession> {
+    return this.resumeCandidate ? this.attemptResume(this.resumeCandidate) : this.attemptFreshPair()
+  }
+
+  private attemptFreshPair(): Promise<VexSession> {
     return new Promise<VexSession>((resolve, reject) => {
       this.connectResolve = resolve
       this.connectReject  = reject
@@ -147,9 +219,60 @@ export class VexConnect {
 
       this.ws.addEventListener('close', () => {
         clearTimeout(timer)
+        this.stopKeepalive()
         if (this.session) this.disconnectHandlers.forEach(fn => fn())
         else reject(new Error('VexConnect: connection closed before approval'))
       })
+    })
+  }
+
+  /** Confirms a saved session is still live by pinging the wallet on its topic. */
+  private attemptResume(candidate: VexSession): Promise<VexSession> {
+    return new Promise<VexSession>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pongResolve = null
+        this.cleanup()
+        clearPersisted()
+        reject(new Error('VexConnect: resume failed — no response from wallet'))
+      }, RESUME_TIMEOUT_MS)
+
+      try {
+        this.ws = new WebSocket(this.opts.relayUrl)
+      } catch (e) {
+        clearTimeout(timer)
+        clearPersisted()
+        reject(new Error(`VexConnect: cannot open WebSocket — ${(e as Error).message}`))
+        return
+      }
+
+      this.ws.addEventListener('open', () => {
+        void this.send({ type: 'subscribe', topic: this.sid })
+        void this.send({ type: 'ping', topic: this.sid })
+      })
+
+      this.ws.addEventListener('message', (ev: MessageEvent<string>) => {
+        void this.handleMsg(ev.data)
+      })
+
+      this.ws.addEventListener('error', () => {
+        clearTimeout(timer)
+        clearPersisted()
+        reject(new Error('VexConnect: WebSocket error during resume'))
+      })
+
+      this.ws.addEventListener('close', () => {
+        clearTimeout(timer)
+        this.stopKeepalive()
+        if (this.session) this.disconnectHandlers.forEach(fn => fn())
+      })
+
+      this.pongResolve = () => {
+        clearTimeout(timer)
+        this.pongResolve = null
+        this.session = candidate
+        this.startKeepalive()
+        resolve(candidate)
+      }
     })
   }
 
@@ -175,6 +298,7 @@ export class VexConnect {
   disconnect() {
     if (this.ws?.readyState === WebSocket.OPEN)
       void this.send({ type: 'session_delete', topic: this.sid, payload: {} })
+    clearPersisted()
     this.cleanup()
     this.disconnectHandlers.forEach(fn => fn())
   }
@@ -187,10 +311,17 @@ export class VexConnect {
   // ── Private ───────────────────────────────────────────────────────────────
 
   private async send(msg: RelayMsg) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return
+    // Capture the socket up front: cleanup() can null this.ws while the
+    // encryption below is still in flight (e.g. disconnect() fires this then
+    // immediately calls cleanup() without waiting). Re-check readyState via
+    // this local reference afterward instead of dereferencing this.ws again,
+    // which could crash on a socket that's since been torn down.
+    const ws = this.ws
+    if (ws?.readyState !== WebSocket.OPEN) return
     const wire: RelayWireMsg = { type: msg.type, topic: msg.topic }
     if (msg.payload) wire.payload = await encryptPayload(this.symKey, JSON.stringify(msg.payload))
-    this.ws.send(JSON.stringify(wire))
+    if (ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify(wire))
   }
 
   private async handleMsg(raw: string) {
@@ -207,6 +338,8 @@ export class VexConnect {
       const publicKey = payload?.publicKey as string | undefined
       if (!account || !publicKey) return
       this.session = { sessionId: this.sid, account, publicKey }
+      savePersisted({ sid: this.sid, symKeyB64Url: toBase64Url(this.symKey), session: this.session })
+      this.startKeepalive()
       this.connectResolve?.(this.session)
       this.connectResolve = this.connectReject = null
     }
@@ -228,14 +361,35 @@ export class VexConnect {
       else p.resolve({ txId: payload?.txId as string, blockNum: payload?.blockNum as number ?? 0 })
     }
 
+    else if (type === 'pong') {
+      this.pongResolve?.()
+    }
+
     else if (type === 'session_delete') {
       this.session = null
+      clearPersisted()
       this.cleanup()
       this.disconnectHandlers.forEach(fn => fn())
     }
   }
 
+  /** Periodic ping while a session is active, so a silently-dropped connection
+   * (idle proxy/NAT timeout, backgrounded mobile browser) surfaces as a
+   * disconnect instead of a confusing failure on the next real request. */
+  private startKeepalive() {
+    this.stopKeepalive()
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) void this.send({ type: 'ping', topic: this.sid })
+    }, KEEPALIVE_INTERVAL_MS)
+  }
+
+  private stopKeepalive() {
+    if (this.keepaliveTimer !== null) clearInterval(this.keepaliveTimer)
+    this.keepaliveTimer = null
+  }
+
   private cleanup() {
+    this.stopKeepalive()
     try { this.ws?.close() } catch { /* ignore */ }
     this.ws = null
     this.pending.forEach(({ reject }) => reject(new Error('VexConnect: session ended')))

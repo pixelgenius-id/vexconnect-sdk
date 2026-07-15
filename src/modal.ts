@@ -1,5 +1,5 @@
 import QRCode from 'qrcode'
-import { VexConnect, VexSession, VEXCONNECT_RELAY } from './core'
+import { VexConnect, VexSession, VEXCONNECT_RELAY } from './core.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -103,13 +103,28 @@ async function fetchWallets(): Promise<WalletEntry[]> {
 
 export function openVexConnectModal(opts: VexConnectModalOptions): Promise<VexConnectResult> {
   return new Promise((resolve, reject) => {
-    if (opts.wallets !== undefined) {
-      new VexConnectModal(opts, opts.wallets, resolve, reject).mount()
+    const showModal = () => {
+      if (opts.wallets !== undefined) {
+        new VexConnectModal(opts, opts.wallets, resolve, reject).mount()
+        return
+      }
+      const modal = new VexConnectModal(opts, null, resolve, reject)
+      modal.mount()
+      fetchWallets().then((wallets) => modal.setWallets(wallets))
+    }
+
+    // Silently resume a previously-approved session (mirrors WalletConnect's
+    // pairing persistence) - only falls through to the pairing modal if
+    // there's nothing saved, or the wallet doesn't answer the resume ping.
+    const resumed = VexConnect.tryResume(opts)
+    if (!resumed) {
+      showModal()
       return
     }
-    const modal = new VexConnectModal(opts, null, resolve, reject)
-    modal.mount()
-    fetchWallets().then((wallets) => modal.setWallets(wallets))
+    resumed.connect().then(
+      (session) => resolve({ session, bridge: resumed }),
+      showModal,
+    )
   })
 }
 
