@@ -21,10 +21,18 @@ export interface VexSession {
   publicKey: string
 }
 
+export interface AntelopeAction {
+  /** Contract account, e.g. "eosio.token" or "vexcore" */
+  account: string
+  /** Action name, e.g. "transfer" or "deposit" */
+  name: string
+  authorization: { actor: string; permission: string }[]
+  /** Plain JSON action data — the wallet resolves it against the live ABI. */
+  data: Record<string, unknown>
+}
+
 export interface TransactionRequest {
-  /** e.g. "transfer" */
-  action: string
-  params: Record<string, string>
+  actions: AntelopeAction[]
 }
 
 export interface TransactionResult {
@@ -157,7 +165,7 @@ export class VexConnect {
       void this.send({
         type: 'request',
         topic: this.sid,
-        payload: { requestId, action: req.action, params: req.params },
+        payload: { requestId, actions: req.actions },
       })
     })
   }
