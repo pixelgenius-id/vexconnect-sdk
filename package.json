@@ -1,0 +1,30 @@
+{
+  "name": "@pixelgeniusid/vexconnect",
+  "version": "1.0.0",
+  "description": "Connect web dApps to VexWallet — core SDK + modal UI",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "types": "./dist/types/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json && tsc -p tsconfig.types.json",
+    "dev": "tsc -p tsconfig.types.json --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["vexanium", "walletconnect", "dapp", "blockchain", "wallet"],
+  "license": "MIT",
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.7.3"
+  }
+}
