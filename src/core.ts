@@ -13,6 +13,11 @@ const RESUME_TIMEOUT_MS = 4_000
  * of finding out only when a real transaction is sent. */
 const KEEPALIVE_INTERVAL_MS = 20_000
 
+/** How long sendTransaction() waits for the wallet's response before giving up -
+ * without this, a wallet that never replies (crashed, bug, user never acts on
+ * the approval dialog) leaves the caller's promise pending forever. */
+const TRANSACTION_TIMEOUT_MS = 120_000
+
 // ─── Session persistence ───────────────────────────────────────────────────────
 // Mirrors WalletConnect's pairing persistence: save the topic/key/session so a
 // page reload can resume without re-scanning a QR, as long as the wallet is
@@ -284,7 +289,17 @@ export class VexConnect {
 
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject })
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId)
+        reject(new Error(
+          `VexConnect: no response from wallet after ${TRANSACTION_TIMEOUT_MS / 1000}s — the wallet may not have handled the request, or the transaction may still be processing.`
+        ))
+      }, TRANSACTION_TIMEOUT_MS)
+
+      this.pending.set(requestId, {
+        resolve: (r) => { clearTimeout(timer); resolve(r) },
+        reject:  (e) => { clearTimeout(timer); reject(e) },
+      })
       void this.send({
         type: 'request',
         topic: this.sid,

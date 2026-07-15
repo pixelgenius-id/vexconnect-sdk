@@ -59,6 +59,23 @@ const resumedSession = await resumed.connect()
 assert.strictEqual(resumedSession.account, 'kunka', 'resume should resolve with the same account, no new approval needed')
 console.log('PASS: resume succeeded while the wallet is still listening')
 
+// 2b) sendTransaction: wallet answers with a "response" - confirms the
+// per-request timeout added alongside it doesn't fire when a response
+// actually arrives (it must clear its timer via the wrapped resolve/reject).
+wallet.on('message', async (raw) => {
+  const wire = JSON.parse(raw.toString())
+  if (wire.type !== 'request') return
+  const payload = JSON.parse(await (await import('./dist/esm/crypto.js')).decryptPayload(symKey, wire.payload))
+  const respEnv = await encryptPayload(symKey, JSON.stringify({ requestId: payload.requestId, txId: 'abc123', blockNum: 42 }))
+  wallet.send(JSON.stringify({ type: 'response', topic: sid, payload: respEnv }))
+})
+const txResult = await resumed.sendTransaction({
+  actions: [{ account: 'vexcore', name: 'deposit', authorization: [{ actor: 'kunka', permission: 'active' }], data: { owner: 'kunka', amount: '1.0000 VEX' } }],
+})
+assert.strictEqual(txResult.txId, 'abc123', 'sendTransaction should resolve with the wallet-provided txId')
+assert.strictEqual(txResult.blockNum, 42, 'sendTransaction should resolve with the wallet-provided blockNum')
+console.log('PASS: sendTransaction resolves normally when the wallet responds (per-request timeout stays dormant)')
+
 wallet.close()
 vc.disconnect()
 resumed.disconnect()
