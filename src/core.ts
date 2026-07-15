@@ -1,9 +1,17 @@
-import { decryptPayload, encryptPayload, fromBase64Url, toBase64Url, type Envelope } from './crypto.js'
+import {
+  decryptPayload, encryptPayload, fromBase64Url, toBase64Url,
+  generateX25519KeyPair, deriveSessionKey, type Envelope, type X25519KeyPair,
+} from './crypto.js'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Relay hosted by Pixel Genius — all sessions go through here. */
+/** Relay hosted by Pixel Genius. First entry is the one embedded in the
+ * pairing URI (the only one the wallet ever learns about from a QR scan) —
+ * later entries are tried only as reconnect fallbacks for an already-paired
+ * session. Redundancy only actually kicks in once a second relay is deployed
+ * and added here; with one entry this behaves exactly as a single relay. */
 export const VEXCONNECT_RELAY = 'wss://connect.nodespark.fun'
+const DEFAULT_RELAY_URLS = [VEXCONNECT_RELAY]
 
 /** How long a silent resume waits for the wallet to answer a ping before giving up. */
 const RESUME_TIMEOUT_MS = 4_000
@@ -18,6 +26,19 @@ const KEEPALIVE_INTERVAL_MS = 20_000
  * the approval dialog) leaves the caller's promise pending forever. */
 const TRANSACTION_TIMEOUT_MS = 120_000
 
+/** Max age of a persisted session before it's treated as expired, regardless
+ * of whether the wallet would still answer a resume ping - mirrors
+ * WalletConnect's session TTL (they use 7 days). Bounds how long a stored
+ * key/approval stays valid on disk instead of trusting it forever. */
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Reconnect backoff: 1s, 2s, 4s, 8s, 16s, capped, then give up and tell the
+ * app the session is gone (rather than retrying forever in the background
+ * while the UI silently shows a stale "connected" state). */
+const RECONNECT_BASE_DELAY_MS = 1_000
+const RECONNECT_MAX_DELAY_MS  = 16_000
+const RECONNECT_MAX_ATTEMPTS  = 5
+
 // ─── Session persistence ───────────────────────────────────────────────────────
 // Mirrors WalletConnect's pairing persistence: save the topic/key/session so a
 // page reload can resume without re-scanning a QR, as long as the wallet is
@@ -29,15 +50,25 @@ const hasStorage = typeof localStorage !== 'undefined'
 
 interface PersistedSession {
   sid: string
-  symKeyB64Url: string
+  /** The ECDH-derived AES key, not a keypair — resume reuses it directly
+   * rather than re-running the handshake, same as WalletConnect (a reconnect
+   * re-opens transport, it doesn't re-derive the session key). */
+  sessionKeyB64Url: string
   session: VexSession
+  approvedAt: number
 }
 
 function loadPersisted(): PersistedSession | null {
   if (!hasStorage) return null
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as PersistedSession) : null
+    if (!raw) return null
+    const p = JSON.parse(raw) as PersistedSession
+    if (Date.now() - p.approvedAt > SESSION_TTL_MS) {
+      localStorage.removeItem(STORAGE_KEY)
+      return null
+    }
+    return p
   } catch {
     return null
   }
@@ -59,6 +90,9 @@ export interface VexConnectOptions {
   dappIcon?: string
   /** Session connect timeout ms. Default: 300 000 */
   connectTimeoutMs?: number
+  /** Relay URLs to try, in order. First is embedded in the pairing URI;
+   * later ones are reconnect-only fallbacks. Default: just the hosted relay. */
+  relayUrls?: string[]
 }
 
 export interface VexSession {
@@ -92,25 +126,39 @@ interface RelayMsg {
   payload?: Record<string, unknown>
 }
 
-/** Wire shape actually sent to the relay — payload is ciphertext, never plain. */
+/** Wire shape actually sent to the relay — payload is ciphertext, never plain.
+ * `pub` carries the wallet's ephemeral X25519 public key on the one message
+ * that establishes the session key (session_approve) - a public key isn't
+ * secret, so it travels in the clear alongside the (still-encryptable-only-
+ * after-this-arrives) payload. */
 interface RelayWireMsg {
   type: string
   topic?: string
   payload?: Envelope
+  pub?: string
 }
 
 // ─── VexConnect core class ────────────────────────────────────────────────────
 
 export class VexConnect {
   private readonly sid: string
-  private readonly symKey: Uint8Array
-  private readonly opts: Required<VexConnectOptions> & { relayUrl: string }
+  private readonly opts: Required<Omit<VexConnectOptions, 'relayUrls'>> & { relayUrls: string[] }
+  /** Own X25519 keypair — only generated for a fresh pairing. Resume skips
+   * ECDH entirely and reuses the already-derived session key. */
+  private readonly keyPair: X25519KeyPair | null
+  /** AES-256 key. Null until the ECDH handshake completes (fresh pairing);
+   * pre-populated immediately when constructed via tryResume(). */
+  private sessionKey: Uint8Array | null
   /** Set only when constructed via tryResume() — the session to confirm, not yet trusted. */
   private readonly resumeCandidate: VexSession | null
 
   private ws: WebSocket | null = null
   private session: VexSession | null = null
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null
+
+  private relayIndex = 0
+  private reconnectAttempt = 0
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   private connectResolve: ((s: VexSession) => void) | null = null
   private connectReject:  ((e: Error) => void) | null = null
@@ -123,11 +171,21 @@ export class VexConnect {
   private disconnectHandlers: Array<() => void> = []
   private errorHandlers:      Array<(e: Error) => void> = []
 
-  constructor(opts: VexConnectOptions, resume?: { sid: string; symKey: Uint8Array; session: VexSession }) {
+  constructor(
+    opts: VexConnectOptions,
+    resume?: { sid: string; sessionKey: Uint8Array; session: VexSession },
+  ) {
     this.sid             = resume?.sid ?? crypto.randomUUID()
-    this.symKey          = resume?.symKey ?? crypto.getRandomValues(new Uint8Array(32))
     this.resumeCandidate = resume?.session ?? null
-    this.opts            = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
+    this.keyPair         = resume ? null : generateX25519KeyPair()
+    this.sessionKey      = resume?.sessionKey ?? null
+    this.opts = {
+      dappName: opts.dappName,
+      dappUrl:  opts.dappUrl,
+      dappIcon: opts.dappIcon ?? '',
+      connectTimeoutMs: opts.connectTimeoutMs ?? 300_000,
+      relayUrls: opts.relayUrls ?? DEFAULT_RELAY_URLS,
+    }
 
     // Mobile browsers suspend/kill the WS while the tab is backgrounded (e.g.
     // the user switches to the wallet app to approve something) and drop the
@@ -142,10 +200,38 @@ export class VexConnect {
     }
   }
 
+  private get currentRelayUrl(): string {
+    return this.opts.relayUrls[this.relayIndex % this.opts.relayUrls.length]
+  }
+
   private reconnectIfNeeded() {
-    if (this.session && this.ws?.readyState !== WebSocket.OPEN) {
-      this.attemptResume(this.session).catch(() => this.disconnectHandlers.forEach(fn => fn()))
+    if (!this.session || this.ws?.readyState === WebSocket.OPEN) return
+    // A real-world signal (network back, tab visible) just fired - worth a
+    // fresh attempt cycle even if the backoff series had already given up.
+    this.reconnectAttempt = 0
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+    this.scheduleReconnect()
+  }
+
+  /** Exponential backoff (1s/2s/4s/8s/16s), trying the next relay in
+   * `relayUrls` each attempt. Gives up and fires disconnectHandlers only
+   * after RECONNECT_MAX_ATTEMPTS - a brief blip shouldn't kick the user back
+   * to the connect screen, but a genuinely dead wallet/network should. */
+  private scheduleReconnect() {
+    if (!this.session || this.reconnectTimer) return
+    if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+      this.reconnectAttempt = 0
+      this.disconnectHandlers.forEach(fn => fn())
+      return
     }
+    const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_DELAY_MS)
+    this.reconnectAttempt++
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (!this.session) return
+      this.relayIndex++
+      this.attemptResume(this.session).catch(() => this.scheduleReconnect())
+    }, delay)
   }
 
   /**
@@ -160,31 +246,35 @@ export class VexConnect {
   static tryResume(opts: VexConnectOptions): VexConnect | null {
     const p = loadPersisted()
     if (!p) return null
-    let symKey: Uint8Array
+    let sessionKey: Uint8Array
     try {
-      symKey = fromBase64Url(p.symKeyB64Url)
+      sessionKey = fromBase64Url(p.sessionKeyB64Url)
     } catch {
       clearPersisted()
       return null
     }
-    return new VexConnect(opts, { sid: p.sid, symKey, session: p.session })
+    return new VexConnect(opts, { sid: p.sid, sessionKey, session: p.session })
   }
 
   // ── URI ───────────────────────────────────────────────────────────────────
 
   /**
    * Returns the vexconnect:// pairing URI. Encode as QR for the wallet to scan.
-   * Carries the symmetric key out-of-band (via QR/deep-link, never through the
-   * relay) so the relay only ever sees encrypted payloads — same "blind relay"
-   * property WalletConnect's bridge servers have.
+   * Carries the dApp's X25519 *public* key only — never a secret. The wallet
+   * generates its own ephemeral keypair on approval and the two sides derive
+   * a shared AES key via ECDH (mirrors WalletConnect v2's session key
+   * derivation), so a leaked/logged QR or URI is useless on its own: it
+   * takes the wallet's ephemeral private key too, which never leaves the
+   * wallet and is discarded once the session key is derived.
    */
   getUri(): string {
+    if (!this.keyPair) throw new Error('VexConnect: getUri() is only valid for a fresh pairing, not a resumed session')
     const p = new URLSearchParams({
       sid:   this.sid,
-      relay: this.opts.relayUrl,
+      relay: this.currentRelayUrl,
       name:  this.opts.dappName,
       url:   this.opts.dappUrl,
-      key:   toBase64Url(this.symKey),
+      pub:   toBase64Url(this.keyPair.publicKey),
     })
     if (this.opts.dappIcon) p.set('icon', this.opts.dappIcon)
     return `vexconnect://wc?${p}`
@@ -218,7 +308,7 @@ export class VexConnect {
       }, this.opts.connectTimeoutMs)
 
       try {
-        this.ws = new WebSocket(this.opts.relayUrl)
+        this.ws = new WebSocket(this.currentRelayUrl)
       } catch (e) {
         clearTimeout(timer)
         reject(new Error(`VexConnect: cannot open WebSocket — ${(e as Error).message}`))
@@ -245,8 +335,9 @@ export class VexConnect {
         this.stopKeepalive()
         if (this.session) {
           // Connection dropped mid-session (not a rejection/never-approved) -
-          // try once to resume before telling the app the session is gone.
-          this.attemptResume(this.session).catch(() => this.disconnectHandlers.forEach(fn => fn()))
+          // let the backoff reconnect loop handle it instead of declaring the
+          // session dead on the very first blip.
+          this.scheduleReconnect()
         } else {
           reject(new Error('VexConnect: connection closed before approval'))
         }
@@ -265,10 +356,9 @@ export class VexConnect {
       }, RESUME_TIMEOUT_MS)
 
       try {
-        this.ws = new WebSocket(this.opts.relayUrl)
+        this.ws = new WebSocket(this.currentRelayUrl)
       } catch (e) {
         clearTimeout(timer)
-        clearPersisted()
         reject(new Error(`VexConnect: cannot open WebSocket — ${(e as Error).message}`))
         return
       }
@@ -284,20 +374,20 @@ export class VexConnect {
 
       this.ws.addEventListener('error', () => {
         clearTimeout(timer)
-        clearPersisted()
         reject(new Error('VexConnect: WebSocket error during resume'))
       })
 
       this.ws.addEventListener('close', () => {
         clearTimeout(timer)
         this.stopKeepalive()
-        if (this.session) this.disconnectHandlers.forEach(fn => fn())
+        this.scheduleReconnect()
       })
 
       this.pongResolve = () => {
         clearTimeout(timer)
         this.pongResolve = null
         this.session = candidate
+        this.reconnectAttempt = 0
         this.startKeepalive()
         resolve(candidate)
       }
@@ -334,8 +424,15 @@ export class VexConnect {
   // ── Disconnect ────────────────────────────────────────────────────────────
 
   disconnect() {
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     if (this.ws?.readyState === WebSocket.OPEN)
       void this.send({ type: 'session_delete', topic: this.sid, payload: {} })
+    // Must clear session before the socket's own 'close' listener fires
+    // (asynchronously, after ws.close() below) - otherwise it sees a
+    // still-truthy session and treats this deliberate disconnect as an
+    // unexpected drop, kicking off a reconnect attempt right after we asked
+    // to disconnect.
+    this.session = null
     clearPersisted()
     this.cleanup()
     this.disconnectHandlers.forEach(fn => fn())
@@ -357,7 +454,13 @@ export class VexConnect {
     const ws = this.ws
     if (ws?.readyState !== WebSocket.OPEN) return
     const wire: RelayWireMsg = { type: msg.type, topic: msg.topic }
-    if (msg.payload) wire.payload = await encryptPayload(this.symKey, JSON.stringify(msg.payload))
+    if (msg.payload) {
+      // Only 'subscribe' (no payload) can be sent before the ECDH handshake
+      // resolves this - every payload-bearing send happens after a session
+      // exists, by which point sessionKey is always set.
+      if (!this.sessionKey) return
+      wire.payload = await encryptPayload(this.sessionKey, JSON.stringify(msg.payload))
+    }
     if (ws.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify(wire))
   }
@@ -367,8 +470,22 @@ export class VexConnect {
     try { wire = JSON.parse(raw) } catch { return }
 
     const type = wire.type
+
+    if (type === 'session_approve' && !this.sessionKey) {
+      // Fresh pairing: the wallet's ephemeral X25519 public key travels in
+      // the clear on this one message (it's not secret) - derive the shared
+      // AES key now, before anything (including this message's own payload)
+      // can be decrypted.
+      if (!wire.pub || !this.keyPair) return
+      try {
+        this.sessionKey = deriveSessionKey(this.keyPair.secretKey, fromBase64Url(wire.pub))
+      } catch { return }
+    }
+
+    if (!this.sessionKey) return // nothing decryptable yet
+
     const payload: Record<string, unknown> | undefined = wire.payload
-      ? JSON.parse(await decryptPayload(this.symKey, wire.payload))
+      ? JSON.parse(await decryptPayload(this.sessionKey, wire.payload))
       : undefined
 
     if (type === 'session_approve') {
@@ -376,7 +493,12 @@ export class VexConnect {
       const publicKey = payload?.publicKey as string | undefined
       if (!account || !publicKey) return
       this.session = { sessionId: this.sid, account, publicKey }
-      savePersisted({ sid: this.sid, symKeyB64Url: toBase64Url(this.symKey), session: this.session })
+      savePersisted({
+        sid: this.sid,
+        sessionKeyB64Url: toBase64Url(this.sessionKey),
+        session: this.session,
+        approvedAt: Date.now(),
+      })
       this.startKeepalive()
       this.connectResolve?.(this.session)
       this.connectResolve = this.connectReject = null
