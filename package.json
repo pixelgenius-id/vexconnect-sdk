@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json && tsc -p tsconfig.types.json",
     "dev": "tsc -p tsconfig.types.json --watch",
+    "test": "npm run build && node test_crypto.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": ["vexanium", "walletconnect", "dapp", "blockchain", "wallet"],

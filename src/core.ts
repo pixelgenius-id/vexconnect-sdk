@@ -1,3 +1,5 @@
+import { decryptPayload, encryptPayload, toBase64Url, type Envelope } from './crypto'
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Relay hosted by Pixel Genius — all sessions go through here. */
@@ -36,10 +38,18 @@ interface RelayMsg {
   payload?: Record<string, unknown>
 }
 
+/** Wire shape actually sent to the relay — payload is ciphertext, never plain. */
+interface RelayWireMsg {
+  type: string
+  topic?: string
+  payload?: Envelope
+}
+
 // ─── VexConnect core class ────────────────────────────────────────────────────
 
 export class VexConnect {
   private readonly sid: string
+  private readonly symKey: Uint8Array
   private readonly opts: Required<VexConnectOptions> & { relayUrl: string }
 
   private ws: WebSocket | null = null
@@ -56,19 +66,26 @@ export class VexConnect {
   private errorHandlers:      Array<(e: Error) => void> = []
 
   constructor(opts: VexConnectOptions) {
-    this.sid  = crypto.randomUUID()
-    this.opts = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
+    this.sid    = crypto.randomUUID()
+    this.symKey = crypto.getRandomValues(new Uint8Array(32))
+    this.opts   = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
   }
 
   // ── URI ───────────────────────────────────────────────────────────────────
 
-  /** Returns the vexconnect:// pairing URI. Encode as QR for the wallet to scan. */
+  /**
+   * Returns the vexconnect:// pairing URI. Encode as QR for the wallet to scan.
+   * Carries the symmetric key out-of-band (via QR/deep-link, never through the
+   * relay) so the relay only ever sees encrypted payloads — same "blind relay"
+   * property WalletConnect's bridge servers have.
+   */
   getUri(): string {
     const p = new URLSearchParams({
       sid:   this.sid,
       relay: this.opts.relayUrl,
       name:  this.opts.dappName,
       url:   this.opts.dappUrl,
+      key:   toBase64Url(this.symKey),
     })
     if (this.opts.dappIcon) p.set('icon', this.opts.dappIcon)
     return `vexconnect://wc?${p}`
@@ -106,11 +123,11 @@ export class VexConnect {
       }
 
       this.ws.addEventListener('open', () => {
-        this.send({ type: 'subscribe', topic: this.sid })
+        void this.send({ type: 'subscribe', topic: this.sid })
       })
 
       this.ws.addEventListener('message', (ev: MessageEvent<string>) => {
-        this.handleMsg(ev.data)
+        void this.handleMsg(ev.data)
       })
 
       this.ws.addEventListener('error', () => {
@@ -137,7 +154,7 @@ export class VexConnect {
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
       this.pending.set(requestId, { resolve, reject })
-      this.send({
+      void this.send({
         type: 'request',
         topic: this.sid,
         payload: { requestId, action: req.action, params: req.params },
@@ -149,7 +166,7 @@ export class VexConnect {
 
   disconnect() {
     if (this.ws?.readyState === WebSocket.OPEN)
-      this.send({ type: 'session_delete', topic: this.sid, payload: {} })
+      void this.send({ type: 'session_delete', topic: this.sid, payload: {} })
     this.cleanup()
     this.disconnectHandlers.forEach(fn => fn())
   }
@@ -161,16 +178,21 @@ export class VexConnect {
 
   // ── Private ───────────────────────────────────────────────────────────────
 
-  private send(msg: RelayMsg) {
-    if (this.ws?.readyState === WebSocket.OPEN)
-      this.ws.send(JSON.stringify(msg))
+  private async send(msg: RelayMsg) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return
+    const wire: RelayWireMsg = { type: msg.type, topic: msg.topic }
+    if (msg.payload) wire.payload = await encryptPayload(this.symKey, JSON.stringify(msg.payload))
+    this.ws.send(JSON.stringify(wire))
   }
 
-  private handleMsg(raw: string) {
-    let msg: RelayMsg
-    try { msg = JSON.parse(raw) } catch { return }
+  private async handleMsg(raw: string) {
+    let wire: RelayWireMsg
+    try { wire = JSON.parse(raw) } catch { return }
 
-    const { type, payload } = msg
+    const type = wire.type
+    const payload: Record<string, unknown> | undefined = wire.payload
+      ? JSON.parse(await decryptPayload(this.symKey, wire.payload))
+      : undefined
 
     if (type === 'session_approve') {
       const account   = payload?.account   as string | undefined
