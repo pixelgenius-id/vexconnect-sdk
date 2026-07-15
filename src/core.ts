@@ -57,7 +57,7 @@ export class VexConnect {
 
   constructor(opts: VexConnectOptions) {
     this.sid  = crypto.randomUUID()
-    this.opts = { dappIcon: '', connectTimeoutMs: 300_000, relayUrl: VEXCONNECT_RELAY, ...opts }
+    this.opts = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
   }
 
   // ── URI ───────────────────────────────────────────────────────────────────
