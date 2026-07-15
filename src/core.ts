@@ -128,6 +128,24 @@ export class VexConnect {
     this.symKey          = resume?.symKey ?? crypto.getRandomValues(new Uint8Array(32))
     this.resumeCandidate = resume?.session ?? null
     this.opts            = { dappIcon: '', relayUrl: VEXCONNECT_RELAY, ...opts, connectTimeoutMs: opts.connectTimeoutMs ?? 300_000 }
+
+    // Mobile browsers suspend/kill the WS while the tab is backgrounded (e.g.
+    // the user switches to the wallet app to approve something) and drop the
+    // TCP connection on a wifi/cellular handoff. Catch both by re-attempting
+    // once the tab is foregrounded or the network comes back, instead of
+    // leaving the session dead until the user manually reloads the page.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', () => this.reconnectIfNeeded())
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.reconnectIfNeeded()
+      })
+    }
+  }
+
+  private reconnectIfNeeded() {
+    if (this.session && this.ws?.readyState !== WebSocket.OPEN) {
+      this.attemptResume(this.session).catch(() => this.disconnectHandlers.forEach(fn => fn()))
+    }
   }
 
   /**
@@ -225,8 +243,13 @@ export class VexConnect {
       this.ws.addEventListener('close', () => {
         clearTimeout(timer)
         this.stopKeepalive()
-        if (this.session) this.disconnectHandlers.forEach(fn => fn())
-        else reject(new Error('VexConnect: connection closed before approval'))
+        if (this.session) {
+          // Connection dropped mid-session (not a rejection/never-approved) -
+          // try once to resume before telling the app the session is gone.
+          this.attemptResume(this.session).catch(() => this.disconnectHandlers.forEach(fn => fn()))
+        } else {
+          reject(new Error('VexConnect: connection closed before approval'))
+        }
       })
     })
   }
