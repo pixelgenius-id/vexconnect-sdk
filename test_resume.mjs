@@ -52,6 +52,33 @@ const session = await connectPromise
 assert.strictEqual(session.account, 'kunka', 'fresh approve should resolve with the wallet account')
 console.log('PASS: fresh pairing approved via ECDH handshake')
 
+// 1b) Rejection before any approval ever happens - the wallet's very first
+// (and only) message is session_reject, which must still carry `pub` or the
+// dApp can never derive a key to decrypt it, and the reject is silently
+// dropped (regression test for exactly that bug).
+{
+  const vc2 = new VexConnect({ dappName: 'Test dApp', dappUrl: 'https://test.local', connectTimeoutMs: 10_000 })
+  const uri2 = new URL(vc2.getUri())
+  const sid2 = uri2.searchParams.get('sid')
+  const dappPub2 = fromBase64Url(uri2.searchParams.get('pub'))
+  const walletKeyPair2 = generateX25519KeyPair()
+  const sessionKey2 = deriveSessionKey(walletKeyPair2.secretKey, dappPub2)
+
+  const wallet2 = new WebSocket('wss://connect.nodespark.fun/')
+  await new Promise((r) => wallet2.on('open', r))
+  wallet2.send(JSON.stringify({ type: 'subscribe', topic: sid2 }))
+  await new Promise((r) => setTimeout(r, 200))
+
+  const connectPromise2 = vc2.connect()
+  await new Promise((r) => setTimeout(r, 300))
+  const rejectEnv = await encryptPayload(sessionKey2, JSON.stringify({ reason: 'User rejected' }))
+  wallet2.send(JSON.stringify({ type: 'session_reject', topic: sid2, payload: rejectEnv, pub: toBase64Url(walletKeyPair2.publicKey) }))
+
+  await assert.rejects(() => connectPromise2, /rejected/, 'a reject-only handshake must surface the rejection, not hang')
+  console.log('PASS: session_reject with no prior approve still decrypts and rejects promptly')
+  wallet2.close()
+}
+
 // 2) Simulate a page reload: nothing survives except localStorage. Resume
 // must reuse the already-derived session key directly - no new handshake.
 const resumed = VexConnect.tryResume({ dappName: 'Test dApp', dappUrl: 'https://test.local' })

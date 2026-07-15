@@ -471,12 +471,15 @@ export class VexConnect {
 
     const type = wire.type
 
-    if (type === 'session_approve' && !this.sessionKey) {
+    if (wire.pub && !this.sessionKey) {
       // Fresh pairing: the wallet's ephemeral X25519 public key travels in
-      // the clear on this one message (it's not secret) - derive the shared
-      // AES key now, before anything (including this message's own payload)
-      // can be decrypted.
-      if (!wire.pub || !this.keyPair) return
+      // the clear on the wallet's first message (it's not secret) - derive
+      // the shared AES key now, before anything (including that message's
+      // own payload) can be decrypted. Checked on ANY message type, not just
+      // session_approve - a wallet rejecting the pairing outright never
+      // approves, but its session_reject still needs to be decryptable, or
+      // the reject is silently dropped and the dApp hangs until timeout.
+      if (!this.keyPair) return
       try {
         this.sessionKey = deriveSessionKey(this.keyPair.secretKey, fromBase64Url(wire.pub))
       } catch { return }
