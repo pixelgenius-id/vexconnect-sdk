@@ -9,8 +9,24 @@ export interface WalletEntry {
   iconUrl: string
   description?: string
   deepLinkScheme?: string
+  /**
+   * https:// base URL the wallet has verified via its own App Links/Universal
+   * Links config (assetlinks.json / apple-app-site-association). When set,
+   * the pairing URI is wrapped as `${universalLink}?uri=<encoded uri>` so
+   * tapping it opens the wallet directly, or falls back to a normal webpage
+   * if the app isn't installed. Dynamic per-wallet — same model as
+   * WalletConnect's wallet registry, no domain is hardcoded by the SDK.
+   */
+  universalLink?: string
   playStoreUrl?: string
   appStoreUrl?: string
+}
+
+/** Wraps the raw pairing URI for a specific wallet's deep-link/QR target. */
+function walletOpenUrl(wallet: WalletEntry, coreUri: string): string {
+  if (!wallet.universalLink) return coreUri
+  const sep = wallet.universalLink.includes('?') ? '&' : '?'
+  return `${wallet.universalLink}${sep}uri=${encodeURIComponent(coreUri)}`
 }
 
 export interface VexConnectModalOptions {
@@ -450,11 +466,12 @@ class VexConnectModal {
     p.appendChild(cpBtn)
 
     if (this.selected?.deepLinkScheme) {
+      const wallet = this.selected
       p.insertAdjacentHTML('beforeend', `<div class="div"><span>or open on this device</span></div>`)
       const dl = document.createElement('button')
       dl.className = 'dlbtn'
-      dl.textContent = `Open ${this.selected.name}`
-      dl.addEventListener('click', () => { window.location.href = this.vc.getUri() })
+      dl.textContent = `Open ${wallet.name}`
+      dl.addEventListener('click', () => { window.location.href = walletOpenUrl(wallet, this.vc.getUri()) })
       p.appendChild(dl)
     }
 
@@ -468,8 +485,11 @@ class VexConnectModal {
   private async renderQr() {
     const el = this.shadow.getElementById('vc-qr')
     if (!el) return
+    // Wrap in the selected wallet's universal link when it has one, so any
+    // generic camera QR scanner (not just the wallet's own) can open it.
+    const uri = this.selected ? walletOpenUrl(this.selected, this.vc.getUri()) : this.vc.getUri()
     try {
-      el.innerHTML = await QRCode.toString(this.vc.getUri(), {
+      el.innerHTML = await QRCode.toString(uri, {
         type: 'svg', margin: 0,
         color: { dark: '#000000', light: '#ffffff' },
         errorCorrectionLevel: 'H',
@@ -480,7 +500,7 @@ class VexConnectModal {
       const iconSrc = this.selected?.iconUrl ?? VEXWALLET_ICON
       logo.innerHTML = `<img src="${iconSrc}" alt="wallet icon"/>`
       el.appendChild(logo)
-    } catch { el.textContent = this.vc.getUri() }
+    } catch { el.textContent = uri }
   }
 
   private startConnect() {
@@ -505,10 +525,11 @@ class VexConnectModal {
       ${this.selected ? `<div class="cwn">${this.selected.name}</div>` : ''}
       <div class="cs">Open ${this.selected?.name ?? 'your wallet'} and approve the connection request.</div>`
     if (this.selected?.deepLinkScheme) {
-      const uri = this.vc.getUri()
+      const wallet = this.selected
+      const uri = walletOpenUrl(wallet, this.vc.getUri())
       const btn = document.createElement('button')
       btn.className = 'dlbtn'
-      btn.textContent = `Open ${this.selected.name}`
+      btn.textContent = `Open ${wallet.name}`
       btn.addEventListener('click', () => { window.location.href = uri })
       p.appendChild(btn)
     }
